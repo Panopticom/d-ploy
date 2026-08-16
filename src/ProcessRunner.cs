@@ -16,6 +16,7 @@ public static class ProcessRunner {
         string? workingDirectory = null,
         TimeSpan? timeout = null,
         Action<string>? onOutputLine = null,
+        IReadOnlyDictionary<string, string>? env = null,
         CancellationToken ct = default) {
 
         var psi = new ProcessStartInfo {
@@ -26,6 +27,8 @@ public static class ProcessRunner {
             UseShellExecute        = false,
         };
         foreach (var a in args) psi.ArgumentList.Add(a);
+        if (env is not null)
+            foreach (var (k, v) in env) psi.EnvironmentVariables[k] = v;
 
         using var process = new Process { StartInfo = psi };
         var output = new StringBuilder();

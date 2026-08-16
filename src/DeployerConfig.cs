@@ -25,8 +25,18 @@ public class DeployerConfig {
     /// <summary>Bearer secret for webhook requests.</summary>
     public string? WebhookSecret { get; set; }
 
-    /// <summary>Interval for the periodic reconcile scan (also drives auto-update tag polling).</summary>
+    /// <summary>Interval for the periodic reconcile scan — the safety-net desired/deployed
+    /// comparison, not release checking. Also the fallback release-check cadence when
+    /// UpdateCheckSchedule is unset.</summary>
     public int ReconcileIntervalMinutes { get; set; } = 5;
+
+    /// <summary>
+    /// systemd OnCalendar expression (see `systemd-analyze calendar`) controlling when the
+    /// release-check tag poll runs — e.g. "daily", "*-*-* 03:00:00", "Mon 09:00". Lets update
+    /// checks happen on a real schedule instead of depending on a GitHub webhook being wired
+    /// up. Unset (default) falls back to polling every ReconcileIntervalMinutes, same as before.
+    /// </summary>
+    public string? UpdateCheckSchedule { get; set; }
 
     public Dictionary<string, ProjectConfig> Projects { get; set; } = [];
 }

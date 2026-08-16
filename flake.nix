@@ -16,7 +16,7 @@
       packages.${system} = rec {
         d-ploy = pkgs.buildDotnetModule {
           pname = "d-ploy";
-          version = "0.1.0";
+          version = "0.2.0";
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
             filter = path: type:
@@ -121,6 +121,7 @@
               DataPath        = stateDir;
               InfraRepo       = cfg.infraRepo;
               ReconcileIntervalMinutes = cfg.reconcileIntervalMinutes;
+              UpdateCheckSchedule      = cfg.updateCheckSchedule;
               Projects = lib.mapAttrs (key: proj: {
                 DisplayName      = proj.displayName;
                 RepoUrl          = proj.repoUrl;
@@ -158,6 +159,18 @@
             };
 
             reconcileIntervalMinutes = mkOption { type = types.int; default = 5; };
+
+            updateCheckSchedule = mkOption {
+              type = types.nullOr types.str;
+              default = null;
+              example = "daily";
+              description = ''
+                systemd OnCalendar expression (see `systemd-analyze calendar`) for the
+                release-check tag poll, e.g. "daily", "*-*-* 03:00:00", "Mon 09:00" — lets
+                release checks run on their own schedule instead of depending on a GitHub
+                webhook being wired up. Unset (default) polls every reconcileIntervalMinutes.
+              '';
+            };
 
             webhook = {
               enable = mkEnableOption "GitHub webhook trigger (POST /hook)";

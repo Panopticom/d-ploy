@@ -99,12 +99,12 @@ public class DeployModule : InteractionModuleBase<SocketInteractionContext> {
 
     // ── /deploy auto ──────────────────────────────────────────────────────────
 
-    public enum AutoChoice { Off, Tags, Commits }
+    public enum AutoChoice { Off, Tags, Commits, Ask }
 
     [SlashCommand("auto", "Automatic deployment mode for a project")]
     public async Task Auto(
         [Summary("project"), Autocomplete(typeof(ProjectAutocompleteHandler))] string project,
-        [Summary("mode", "off = manual only, tags = new releases, commits = every push")] AutoChoice mode) {
+        [Summary("mode", "off = manual, tags/commits = auto-deploy, ask = prompt with buttons")] AutoChoice mode) {
         if (Resolve(project) is not { } cfg) { await RespondAsync("Unknown project.", ephemeral: true); return; }
 
         _state.Update(project, s => {

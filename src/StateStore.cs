@@ -5,7 +5,9 @@ using Microsoft.Extensions.Options;
 
 namespace DPloy;
 
-public enum AutoMode { Off, Tags, Commits }
+/// <summary>Off = silent/manual. Tags/Commits = auto-deploy new releases. Ask = post a
+/// Deploy/Skip button prompt and wait for an admin instead of deploying automatically.</summary>
+public enum AutoMode { Off, Tags, Commits, Ask }
 
 public class ProjectState {
     /// <summary>Ref we want running: a tag name or "HEAD". Null = whatever is deployed.</summary>
@@ -19,6 +21,11 @@ public class ProjectState {
 
     [JsonConverter(typeof(JsonStringEnumConverter))]
     public AutoMode AutoMode { get; set; } = AutoMode.Off;
+
+    /// <summary>AutoMode.Ask: latest ref we already posted a Deploy/Skip prompt for — keeps
+    /// the reconcile timer from re-posting the same prompt every tick until it's acted on
+    /// (or a newer release supersedes it).</summary>
+    public string? AskedRef { get; set; }
 
     public string? UpdatedBy { get; set; }
     public DateTimeOffset? UpdatedAt { get; set; }
@@ -90,6 +97,7 @@ public class StateStore {
         DeployedRef = s.DeployedRef,
         PreviousRef = s.PreviousRef,
         AutoMode    = s.AutoMode,
+        AskedRef    = s.AskedRef,
         UpdatedBy   = s.UpdatedBy,
         UpdatedAt   = s.UpdatedAt,
     };

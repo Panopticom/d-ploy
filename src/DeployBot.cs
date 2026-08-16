@@ -26,11 +26,18 @@ public class DeployBot : IHostedService {
     }
 
     public async Task StartAsync(CancellationToken cancellationToken) {
-        _client.Log += msg => { _logger.Log(MapLevel(msg.Severity), "{Source}: {Message}", msg.Source, msg.Message); return Task.CompletedTask; };
+        _client.Log += msg => { _logger.Log(MapLevel(msg.Severity), msg.Exception, "{Source}: {Message}", msg.Source, msg.Message); return Task.CompletedTask; };
         _client.Ready += OnReadyAsync;
         _client.InteractionCreated += async interaction => {
             var ctx = new SocketInteractionContext(_client, interaction);
-            await _interactions.ExecuteCommandAsync(ctx, _services);
+            var result = await _interactions.ExecuteCommandAsync(ctx, _services);
+            // Slash commands are hidden from non-admins by Discord itself, but release-ask
+            // buttons are plain channel messages anyone can see — surface a rejection instead
+            // of leaving the click looking like it silently failed.
+            if (!result.IsSuccess && !interaction.HasResponded) {
+                try { await interaction.RespondAsync(result.ErrorReason, ephemeral: true); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Could not report interaction failure"); }
+            }
         };
 
         await _client.LoginAsync(TokenType.Bot, _config.BotToken);
@@ -45,6 +52,7 @@ public class DeployBot : IHostedService {
     private async Task OnReadyAsync() {
         try {
             await _interactions.AddModuleAsync<DeployModule>(_services);
+            await _interactions.AddModuleAsync<ReleaseAskModule>(_services);
             await _interactions.RegisterCommandsToGuildAsync(_config.GuildId);
             _logger.LogInformation("D-Ploy ready — commands registered in guild {GuildId}", _config.GuildId);
         } catch (Exception ex) {

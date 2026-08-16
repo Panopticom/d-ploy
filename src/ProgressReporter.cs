@@ -44,6 +44,27 @@ public class ProgressReporter {
         catch (Exception ex) { _logger.LogWarning(ex, "Could not post announcement"); }
     }
 
+    /// <summary>
+    /// AutoMode.Ask: post a release-ask prompt with Deploy/Skip buttons, pinging the admins.
+    /// Only posts — ReleaseAskModule owns mutating state and editing the message once someone
+    /// responds. Custom IDs are "dploy-ask-{deploy|skip}:{projectKey},{tag}".
+    /// </summary>
+    public async Task AskAsync(string projectKey, ProjectConfig project, string tag) {
+        if (Channel is not { } channel) return;
+        var mentions = string.Join(' ', _config.AdminUserIds.Select(id => $"<@{id}>"));
+        var components = new ComponentBuilder()
+            .WithButton("Deploy", $"dploy-ask-deploy:{projectKey},{tag}", ButtonStyle.Success, new Emoji("🚀"))
+            .WithButton("Skip",   $"dploy-ask-skip:{projectKey},{tag}",   ButtonStyle.Secondary, new Emoji("⏭"))
+            .Build();
+        try {
+            await channel.SendMessageAsync(
+                $"{mentions}\n🔔 **{project.DisplayName}**: new release `{tag}` available. Deploy it?",
+                components: components);
+        } catch (Exception ex) {
+            _logger.LogWarning(ex, "Could not post release-ask prompt");
+        }
+    }
+
     public class Progress {
         private readonly IUserMessage? _message;
         private readonly string _title;

@@ -43,13 +43,24 @@ public class Reconciler : BackgroundService {
         await FinalizePendingSelfSwitchAsync(ct);
         Kick();
 
-        var timer = new PeriodicTimer(TimeSpan.FromMinutes(Math.Max(1, _config.ReconcileIntervalMinutes)));
-        var timerTask = Task.Run(async () => {
-            while (await timer.WaitForNextTickAsync(ct)) {
-                await CheckAutoUpdatesAsync(ct);
+        var hasSchedule = !string.IsNullOrWhiteSpace(_config.UpdateCheckSchedule);
+
+        // The reconcile timer is a cheap safety net (compares desired vs deployed; a no-op
+        // when nothing's pending) and, when no UpdateCheckSchedule is set, also drives the
+        // release-check tag poll — same as before this existed.
+        var reconcileTimer = new PeriodicTimer(TimeSpan.FromMinutes(Math.Max(1, _config.ReconcileIntervalMinutes)));
+        var reconcileTask = Task.Run(async () => {
+            while (await reconcileTimer.WaitForNextTickAsync(ct)) {
+                if (!hasSchedule) await CheckAutoUpdatesAsync(ct);
                 Kick();
             }
         }, ct);
+
+        // UpdateCheckSchedule set: release checks run on their own systemd-calendar schedule
+        // instead — e.g. so it doesn't depend on a GitHub webhook being wired up.
+        var scheduleTask = hasSchedule
+            ? Task.Run(() => RunScheduledUpdateChecksAsync(_config.UpdateCheckSchedule!, ct), ct)
+            : Task.CompletedTask;
 
         await foreach (var key in _kicks.Reader.ReadAllAsync(ct)) {
             var keys = key == "*" ? _config.Projects.Keys.ToList() : new List<string> { key };
@@ -67,6 +78,60 @@ public class Reconciler : BackgroundService {
         }
     }
 
+    // ── Update-check schedule: systemd-calendar-driven alternative to the reconcile
+    //    timer, for release checks that shouldn't depend on a GitHub webhook ─────────
+
+    private async Task RunScheduledUpdateChecksAsync(string schedule, CancellationToken ct) {
+        while (!ct.IsCancellationRequested) {
+            var next = await GetNextCalendarElapseAsync(schedule, ct);
+            if (next is null) {
+                _logger.LogError("Invalid Deployer:UpdateCheckSchedule {Schedule} — release checks disabled until fixed", schedule);
+                await _reporter.AnnounceAsync(
+                    $"⚠️ `Deployer:UpdateCheckSchedule` (`{schedule}`) isn't a valid systemd calendar " +
+                    "expression — release checks are disabled until this is fixed and D-Ploy restarts.");
+                return; // don't spin-loop on a permanently broken expression
+            }
+
+            var delay = next.Value - DateTimeOffset.UtcNow;
+            if (delay > TimeSpan.Zero) {
+                try { await Task.Delay(delay, ct); }
+                catch (OperationCanceledException) { return; }
+            }
+            await CheckAutoUpdatesAsync(ct);
+        }
+    }
+
+    /// <summary>Next occurrence of a systemd OnCalendar expression, via `systemd-analyze
+    /// calendar` (forced to UTC so the "Next elapse:" line is unambiguous to parse).
+    /// Null = the expression is invalid or systemd-analyze isn't available.</summary>
+    private async Task<DateTimeOffset?> GetNextCalendarElapseAsync(string schedule, CancellationToken ct) {
+        var result = await ProcessRunner.RunAsync("systemd-analyze", ["calendar", schedule],
+            timeout: TimeSpan.FromSeconds(10), env: new Dictionary<string, string> { ["TZ"] = "UTC" }, ct: ct);
+        if (!result.Success) {
+            _logger.LogWarning("systemd-analyze calendar {Schedule} failed: {Output}", schedule, result.Output.Trim());
+            return null;
+        }
+
+        foreach (var rawLine in result.Output.Split('\n')) {
+            var line = rawLine.Trim();
+            if (!line.StartsWith("Next elapse:")) continue;
+
+            var value = line["Next elapse:".Length..].Trim(); // "Sat 2026-08-16 03:00:00 UTC"
+            if (value.EndsWith(" UTC")) value = value[..^" UTC".Length];
+            var parts = value.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length < 2) return null;
+            var dateTimePart = $"{parts[^2]} {parts[^1]}"; // drop the leading day-of-week token
+
+            return DateTime.TryParseExact(dateTimePart, "yyyy-MM-dd HH:mm:ss",
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AdjustToUniversal,
+                    out var dt)
+                ? new DateTimeOffset(dt, TimeSpan.Zero)
+                : null;
+        }
+        return null;
+    }
+
     // ── Auto-update: poll tags for projects with autoMode != off ─────────────
 
     private async Task CheckAutoUpdatesAsync(CancellationToken ct) {
@@ -76,6 +141,16 @@ public class Reconciler : BackgroundService {
             try {
                 var latest = await GitRemote.GetLatestTagAsync(project.RepoUrl, ct);
                 if (latest is null || latest == state.DeployedRef || latest == state.DesiredRef) continue;
+
+                // Ask mode: prompt instead of deploying, and only once per release —
+                // AskedRef tracks the last one we already posted buttons for.
+                if (state.AutoMode == AutoMode.Ask) {
+                    if (latest == state.AskedRef) continue;
+                    _state.Update(key, s => s.AskedRef = latest);
+                    await _reporter.AskAsync(key, project, latest);
+                    continue;
+                }
+
                 _state.Update(key, s => { s.DesiredRef = latest; s.UpdatedBy = "auto"; s.UpdatedAt = DateTimeOffset.UtcNow; });
                 await _reporter.AnnounceAsync($"🔔 **{project.DisplayName}**: new release `{latest}` detected — deploying.");
             } catch (Exception ex) {
