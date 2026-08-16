@@ -7,8 +7,7 @@
     <Nullable>enable</Nullable>
     <RootNamespace>DPloy</RootNamespace>
     <AssemblyName>DPloy</AssemblyName>
-    <InvariantGlobalization>true</InvariantGlobalization>
-  </PropertyGroup>
+ </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="Discord.Net" Version="3.19.1" />
