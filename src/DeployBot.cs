@@ -7,7 +7,8 @@ using Microsoft.Extensions.Options;
 
 namespace DPloy;
 
-/// <summary>Single Discord client: connects, registers the /deploy module in the configured guild.</summary>
+/// <summary>Single Discord client: connects, registers the /deploy module globally (guild install
+/// only, but global registration so it also reaches DMs — see DeployModule's doc comment).</summary>
 public class DeployBot : IHostedService {
 
     private readonly DiscordSocketClient _client;
@@ -33,7 +34,12 @@ public class DeployBot : IHostedService {
             var result = await _interactions.ExecuteCommandAsync(ctx, _services);
             // Slash commands are hidden from non-admins by Discord itself, but release-ask
             // buttons are plain channel messages anyone can see — surface a rejection instead
-            // of leaving the click looking like it silently failed.
+            // of leaving the click looking like it silently failed. Kept ephemeral even though
+            // DeployModule's own replies aren't (see its doc comment): a precondition failure —
+            // wrong channel (RequireCommandChannel) or not authorized (RequireAdmin) — is a
+            // rejected no-op, not an audited action, and RequireCommandChannel failures in
+            // particular happen in whatever channel someone mistakenly tried, not the audit
+            // channel, so there's no reason to broadcast it there.
             if (!result.IsSuccess && !interaction.HasResponded) {
                 try { await interaction.RespondAsync(result.ErrorReason, ephemeral: true); }
                 catch (Exception ex) { _logger.LogWarning(ex, "Could not report interaction failure"); }
@@ -51,10 +57,19 @@ public class DeployBot : IHostedService {
 
     private async Task OnReadyAsync() {
         try {
-            await _interactions.AddModuleAsync<DeployModule>(_services);
+            var deployModule = await _interactions.AddModuleAsync<DeployModule>(_services);
             await _interactions.AddModuleAsync<ReleaseAskModule>(_services);
-            await _interactions.RegisterCommandsToGuildAsync(_config.GuildId);
-            _logger.LogInformation("D-Ploy ready — commands registered in guild {GuildId}", _config.GuildId);
+
+            // DeployModule carries its own [IntegrationType]/[CommandContextType] now (guild
+            // install + DMs — NOT user install, see its doc comment), which only takes effect
+            // on globally-registered commands — guild-scoped commands never appear in a DM
+            // regardless of install type, and DM availability has required global registration
+            // since long before install types existed. Drop the old guild-scoped registration
+            // first (no-op once it's actually gone; safe to run every Ready) so the command
+            // doesn't show up twice in the home guild.
+            await _interactions.RemoveModulesFromGuildAsync(_config.GuildId, deployModule);
+            await _interactions.RegisterCommandsGloballyAsync();
+            _logger.LogInformation("D-Ploy ready — commands registered globally (guild install + DMs, no user install)");
         } catch (Exception ex) {
             _logger.LogError(ex, "Command registration failed");
         }

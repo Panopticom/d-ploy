@@ -16,7 +16,7 @@
       packages.${system} = rec {
         d-ploy = pkgs.buildDotnetModule {
           pname = "d-ploy";
-          version = "0.2.0";
+          version = "0.3.0";
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
             filter = path: type:
@@ -115,17 +115,20 @@
 
           appSettings = {
             Deployer = {
-              GuildId         = cfg.guildId;
-              AdminUserIds    = cfg.adminUserIds;
-              DeployChannelId = cfg.deployChannelId;
-              DataPath        = stateDir;
-              InfraRepo       = cfg.infraRepo;
+              GuildId           = cfg.guildId;
+              AdminUserIds      = cfg.adminUserIds;
+              AdminRoleIds      = cfg.adminRoleIds;
+              DeployChannelId   = cfg.deployChannelId;
+              CommandChannelIds = cfg.commandChannelIds;
+              DataPath          = stateDir;
+              InfraRepo         = cfg.infraRepo;
               ReconcileIntervalMinutes = cfg.reconcileIntervalMinutes;
               UpdateCheckSchedule      = cfg.updateCheckSchedule;
               Projects = lib.mapAttrs (key: proj: {
                 DisplayName      = proj.displayName;
                 RepoUrl          = proj.repoUrl;
                 InfraInputName   = proj.infraInputName;
+                NixosAttr        = proj.nixosAttr;
                 SwitchScriptPath = "${switchScripts.${key}}/bin/d-ploy-switch-${key}";
                 HealthUnits      = proj.healthUnits;
                 SoakSeconds      = proj.soakSeconds;
@@ -148,7 +151,27 @@
 
             guildId = mkOption { type = types.str; description = "Guild where /deploy commands are registered."; };
             adminUserIds = mkOption { type = types.listOf types.str; description = "Discord user IDs allowed to deploy."; };
+            adminRoleIds = mkOption {
+              type = types.listOf types.str;
+              default = [];
+              description = ''
+                Discord role IDs allowed to deploy, on top of adminUserIds — anyone holding
+                one of these roles is authorized. Only takes effect in the guild (roles don't
+                exist in a DM, so a DM-only user still needs adminUserIds).
+              '';
+            };
             deployChannelId = mkOption { type = types.str; description = "Channel for live deploy progress messages."; };
+            commandChannelIds = mkOption {
+              type = types.listOf types.str;
+              default = [];
+              description = ''
+                Guild channels /deploy commands may be used in — keeps every command and its
+                result in one predictable, visible place for an audit trail (replies are not
+                ephemeral). Only enforced inside this guild; DMs aren't restricted (and are
+                the only other place /deploy works at all — see the README). Empty/unset
+                (default) falls back to just deployChannelId.
+              '';
+            };
 
             infraRepo = mkOption { type = types.str; description = "SSH URL of the NixOS infra repo (source of truth)."; };
 
@@ -162,13 +185,15 @@
 
             updateCheckSchedule = mkOption {
               type = types.nullOr types.str;
-              default = null;
+              default = "Mon 12:30";
               example = "daily";
               description = ''
                 systemd OnCalendar expression (see `systemd-analyze calendar`) for the
                 release-check tag poll, e.g. "daily", "*-*-* 03:00:00", "Mon 09:00" — lets
                 release checks run on their own schedule instead of depending on a GitHub
-                webhook being wired up. Unset (default) polls every reconcileIntervalMinutes.
+                webhook being wired up. Interpreted in the host's local timezone
+                (`time.timeZone`), not UTC. Defaults to Monday at 12:30pm local time; set to
+                null to fall back to polling every reconcileIntervalMinutes instead.
               '';
             };
 

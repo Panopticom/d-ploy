@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Threading.Channels;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -9,11 +10,25 @@ namespace DPloy;
 /// The heart of D-Ploy: a single-reader convergence loop. Commands, webhooks, and the
 /// periodic timer only mutate desired state (StateStore) and kick the loop; the loop
 /// compares desired vs deployed per project and converges. Single reader = concurrent
-/// deploys serialize for free; durable state = a crash/restart resumes where it left off.
+/// deploys serialize for free — no two `nixos-rebuild switch` invocations ever run at the
+/// same time, even when kicked simultaneously (including a "*" kick touching every project
+/// at once) — as long as ConvergeBatchAsync always fully awaits its own switch before
+/// returning. The self-update path (StartDetachedSelfSwitchAsync) is the one place this took
+/// real care to get right: the switch itself runs in a detached systemd unit so it survives
+/// D-Ploy's own restart, but this loop still AWAITS its resolution
+/// (MonitorDetachedSelfSwitchAsync) rather than treating "detached from our process" as
+/// "detached from the loop" — otherwise the very next queued project would run its own
+/// switch concurrently with it. Durable state = a crash/restart resumes where it left off.
 ///
-/// Converge order (git first — the infra repo is the source of truth):
-///   clone infra → bump flake.lock → commit+push → switch → health soak
-///   → on failure: rollback generation + revert the bump commit
+/// Batching: when more than one project is due for convergence at once (a "*" kick, or
+/// several commands/webhooks queued close together), projects that share a NixosAttr — i.e.
+/// switching the same host config — are converged together: one clone, one set of flake.lock
+/// bumps, one commit, one nixos-rebuild switch, one health soak over the union of their
+/// HealthUnits. This trades per-project failure isolation for fewer, faster convergence
+/// passes: a NixOS generation switch is atomic, so if the soak fails, every project in that
+/// batch rolls back together, even ones that were individually healthy — there's no such
+/// thing as a partial rollback of one project's contribution to a shared generation. See
+/// ConvergeBatchAsync.
 /// </summary>
 public class Reconciler : BackgroundService {
 
@@ -36,6 +51,12 @@ public class Reconciler : BackgroundService {
 
     /// <summary>Ask the loop to look at one project (or everything, when key is null) soon.</summary>
     public void Kick(string? projectKey = null) => _kicks.Writer.TryWrite(projectKey ?? "*");
+
+    /// <summary>A project that's due for convergence: the ref it should move to, and its
+    /// currently-deployed ref (captured once, up front, so a batch's progress title and
+    /// success/failure messages are consistent even though StateStore is mutated as each
+    /// project promotes).</summary>
+    private sealed record PendingProject(string Key, ProjectConfig Project, string Target, string? DeployedRef);
 
     protected override async Task ExecuteAsync(CancellationToken ct) {
         // Give the Discord client a moment to connect so startup announcements land.
@@ -64,15 +85,26 @@ public class Reconciler : BackgroundService {
 
         await foreach (var key in _kicks.Reader.ReadAllAsync(ct)) {
             var keys = key == "*" ? _config.Projects.Keys.ToList() : new List<string> { key };
+
+            var pending = new List<PendingProject>();
             foreach (var k in keys) {
                 if (!_config.Projects.TryGetValue(k, out var project)) continue;
+                var state = _state.Get(k);
+                if (state.DesiredRef is null || state.DesiredRef == state.DeployedRef) continue;
+                pending.Add(new PendingProject(k, project, state.DesiredRef, state.DeployedRef));
+            }
+
+            // Batch same-NixosAttr projects (same host config) into one converge pass each;
+            // different attrs can never share a switch, so they always get their own batch.
+            foreach (var batch in pending.GroupBy(p => p.Project.NixosAttr).Select(g => g.ToList())) {
                 try {
-                    await ConvergeAsync(k, project, ct);
+                    await ConvergeBatchAsync(batch, ct);
                 } catch (OperationCanceledException) when (ct.IsCancellationRequested) {
                     throw;
                 } catch (Exception ex) {
-                    _logger.LogError(ex, "Converge failed for {Project}", k);
-                    await _reporter.AnnounceAsync($"❌ **{project.DisplayName}**: converge crashed — `{ex.Message}`");
+                    var names = string.Join(", ", batch.Select(p => $"**{p.Project.DisplayName}**"));
+                    _logger.LogError(ex, "Converge batch failed for {Projects}", string.Join(",", batch.Select(p => p.Key)));
+                    await _reporter.AnnounceAsync($"❌ {names}: converge crashed — `{ex.Message}`");
                 }
             }
         }
@@ -102,11 +134,14 @@ public class Reconciler : BackgroundService {
     }
 
     /// <summary>Next occurrence of a systemd OnCalendar expression, via `systemd-analyze
-    /// calendar` (forced to UTC so the "Next elapse:" line is unambiguous to parse).
+    /// calendar`. Runs with the host's ambient timezone (no TZ override) so a schedule like
+    /// "Mon 12:30" means 12:30 in the host's configured local time (NixOS `time.timeZone`),
+    /// not UTC — then reads the "(in UTC):" line systemd-analyze always prints alongside
+    /// "Next elapse:", which is unambiguous regardless of what timezone that elapse is in.
     /// Null = the expression is invalid or systemd-analyze isn't available.</summary>
     private async Task<DateTimeOffset?> GetNextCalendarElapseAsync(string schedule, CancellationToken ct) {
         var result = await ProcessRunner.RunAsync("systemd-analyze", ["calendar", schedule],
-            timeout: TimeSpan.FromSeconds(10), env: new Dictionary<string, string> { ["TZ"] = "UTC" }, ct: ct);
+            timeout: TimeSpan.FromSeconds(10), ct: ct);
         if (!result.Success) {
             _logger.LogWarning("systemd-analyze calendar {Schedule} failed: {Output}", schedule, result.Output.Trim());
             return null;
@@ -114,9 +149,9 @@ public class Reconciler : BackgroundService {
 
         foreach (var rawLine in result.Output.Split('\n')) {
             var line = rawLine.Trim();
-            if (!line.StartsWith("Next elapse:")) continue;
+            if (!line.StartsWith("(in UTC):")) continue;
 
-            var value = line["Next elapse:".Length..].Trim(); // "Sat 2026-08-16 03:00:00 UTC"
+            var value = line["(in UTC):".Length..].Trim(); // "Sat 2026-08-16 03:00:00 UTC"
             if (value.EndsWith(" UTC")) value = value[..^" UTC".Length];
             var parts = value.Split(' ', StringSplitOptions.RemoveEmptyEntries);
             if (parts.Length < 2) return null;
@@ -159,37 +194,41 @@ public class Reconciler : BackgroundService {
         }
     }
 
-    // ── Converge one project ──────────────────────────────────────────────────
+    // ── Converge a batch of projects (1 or more, always the same NixosAttr) ───
 
-    private async Task ConvergeAsync(string key, ProjectConfig project, CancellationToken ct) {
-        var state = _state.Get(key);
-        var target = state.DesiredRef;
-        if (target is null || target == state.DeployedRef) return;
+    private async Task ConvergeBatchAsync(List<PendingProject> batch, CancellationToken ct) {
+        var batchId = string.Join("+", batch.Select(p => p.Key));
+        _logger.LogInformation("Converging batch [{Batch}]: {Details}", batchId,
+            string.Join(", ", batch.Select(p => $"{p.Key} {p.DeployedRef ?? "(unknown)"} → {p.Target}")));
 
-        _logger.LogInformation("Converging {Project}: {From} → {To}", key, state.DeployedRef ?? "(unknown)", target);
-        var progress = await _reporter.StartAsync($"**{project.DisplayName}** → `{target}` (was `{state.DeployedRef ?? "unknown"}`)");
+        var title = string.Join(", ", batch.Select(p => $"**{p.Project.DisplayName}** → `{p.Target}` (was `{p.DeployedRef ?? "unknown"}`)"));
+        var progress = await _reporter.StartAsync(title);
 
-        // 1. Fresh infra clone
-        var workDir = Path.Combine(_config.DataPath, "work", key);
+        // 1. Fresh infra clone — one clone shared by every project in the batch.
+        var workDir = Path.Combine(_config.DataPath, "work", batchId);
         if (Directory.Exists(workDir)) Directory.Delete(workDir, recursive: true);
         Directory.CreateDirectory(workDir);
 
         progress.Set("cloning infra repo…");
         var clone = await ProcessRunner.RunAsync("git", ["clone", "--depth", "1", _config.InfraRepo, "."],
             workDir, TimeSpan.FromMinutes(5), ct: ct);
-        if (!clone.Success) { await AbortAsync(progress, key, "infra clone failed", clone.Output); return; }
+        if (!clone.Success) { await AbortBatchAsync(progress, batch, "infra clone failed", clone.Output); return; }
         await ProcessRunner.RunAsync("git", ["config", "user.email", "d-ploy@localhost"], workDir, ct: ct);
         await ProcessRunner.RunAsync("git", ["config", "user.name", "D-Ploy"], workDir, ct: ct);
 
-        // 2. Bump flake.lock to the target ref
-        progress.Set($"updating flake.lock → `{target}`…");
-        var overrideUrl = target == "HEAD"
-            ? $"git+ssh://{ToSshUri(project.RepoUrl)}"
-            : $"git+ssh://{ToSshUri(project.RepoUrl)}?ref={target}";
-        var update = await ProcessRunner.RunAsync("nix",
-            ["flake", "update", project.InfraInputName, "--override-input", project.InfraInputName, overrideUrl],
-            workDir, TimeSpan.FromMinutes(5), ct: ct);
-        if (!update.Success) { await AbortAsync(progress, key, "flake.lock update failed", update.Output); return; }
+        // 2. Bump each project's flake input — one `nix flake update` call per project (same
+        //    proven single-input form as before batching existed), all landing in the same
+        //    flake.lock ahead of a single combined commit below.
+        foreach (var p in batch) {
+            progress.Set($"updating flake.lock → `{p.Key}` = `{p.Target}`…");
+            var overrideUrl = p.Target == "HEAD"
+                ? $"git+ssh://{ToSshUri(p.Project.RepoUrl)}"
+                : $"git+ssh://{ToSshUri(p.Project.RepoUrl)}?ref={p.Target}";
+            var update = await ProcessRunner.RunAsync("nix",
+                ["flake", "update", p.Project.InfraInputName, "--override-input", p.Project.InfraInputName, overrideUrl],
+                workDir, TimeSpan.FromMinutes(5), ct: ct);
+            if (!update.Success) { await AbortBatchAsync(progress, batch, $"flake.lock update failed for `{p.Key}`", update.Output); return; }
+        }
 
         // 3. Commit + push BEFORE switching — git is the source of truth. If the push
         //    fails we stop here: the running system stays consistent with the repo.
@@ -197,62 +236,74 @@ public class Reconciler : BackgroundService {
         string? bumpCommit = null;
         if (dirty) {
             progress.Set("pushing flake.lock bump to infra repo…");
+            var message = batch.Count == 1
+                ? $"d-ploy: {batch[0].Key} → {batch[0].Target}"
+                : $"d-ploy: batch update ({string.Join(", ", batch.Select(p => $"{p.Key} → {p.Target}"))})";
             var committed =
                 (await ProcessRunner.RunAsync("git", ["add", "flake.lock"], workDir, ct: ct)).Success &&
-                (await ProcessRunner.RunAsync("git", ["commit", "-m", $"d-ploy: {key} → {target}"], workDir, ct: ct)).Success &&
+                (await ProcessRunner.RunAsync("git", ["commit", "-m", message], workDir, ct: ct)).Success &&
                 (await ProcessRunner.RunAsync("git", ["push"], workDir, TimeSpan.FromMinutes(2), ct: ct)).Success;
-            if (!committed) { await AbortAsync(progress, key, "flake.lock push failed — system unchanged", ""); return; }
+            if (!committed) { await AbortBatchAsync(progress, batch, "flake.lock push failed — system unchanged", ""); return; }
             bumpCommit = (await ProcessRunner.RunAsync("git", ["rev-parse", "HEAD"], workDir, ct: ct)).Output.Trim();
         }
 
-        // 4. Switch. Self-updates restart this daemon, so they run detached and are
-        //    finalized by FinalizePendingSelfSwitchAsync on next startup.
-        if (project.SelfUpdate) {
-            await StartDetachedSelfSwitchAsync(key, project, target, workDir, progress, ct);
+        // 4. Switch. If ANY project in the batch is the self-update project, the switch might
+        //    restart d-ploy's own unit, so the WHOLE batch runs detached — every project in
+        //    it is finalized together, on next startup or by the monitor below.
+        var selfUpdate = batch.FirstOrDefault(p => p.Project.SelfUpdate);
+        if (selfUpdate is not null) {
+            await StartDetachedSelfSwitchAsync(batch, selfUpdate.Project.SwitchScriptPath, workDir, progress, ct);
             return;
         }
 
         progress.Set("running nixos-rebuild switch…");
-        var lastLine = "";
-        var sw = await ProcessRunner.RunAsync("sudo", [project.SwitchScriptPath, "switch", workDir],
+        var switchScript = batch[0].Project.SwitchScriptPath; // same NixosAttr ⇒ same effective switch
+        var sw = await ProcessRunner.RunAsync("sudo", [switchScript, "switch", workDir],
             workDir, TimeSpan.FromMinutes(45),
-            onOutputLine: line => { lastLine = line; progress.Set($"`switch`: {Sanitize(line)}"); }, ct: ct);
+            onOutputLine: line => progress.Set($"`switch`: {Sanitize(line)}"), ct: ct);
         if (!sw.Success) {
             // Build/switch failed — NixOS left the old generation running; undo the bump.
             await RevertBumpAsync(workDir, bumpCommit, ct);
-            await AbortAsync(progress, key, "nixos-rebuild failed (old generation still running; bump reverted)", sw.Output);
+            await AbortBatchAsync(progress, batch, "nixos-rebuild failed (old generation still running; bump reverted)", sw.Output);
             return;
         }
 
-        // 5. Health soak
+        // 5. Health soak — union of every batched project's health units; the longest
+        //    requested soak wins, since they're all watching the same activation now.
         progress.Set("switch done — health soak…");
-        var failure = await _health.SoakAsync(project.HealthUnits, project.SoakSeconds,
-            s => progress.Set(s), ct);
+        var healthUnits = batch.SelectMany(p => p.Project.HealthUnits).Distinct().ToList();
+        var soakSeconds = batch.Max(p => p.Project.SoakSeconds);
+        var failure = await _health.SoakAsync(healthUnits, soakSeconds, s => progress.Set(s), ct);
 
         if (failure is not null) {
+            // A shared generation can't be partially rolled back — every project in the
+            // batch reverts together, even ones whose own health units were fine.
             progress.Set("unhealthy — rolling back…");
-            var rb = await ProcessRunner.RunAsync("sudo", [project.SwitchScriptPath, "rollback"],
+            var rb = await ProcessRunner.RunAsync("sudo", [switchScript, "rollback"],
                 workDir, TimeSpan.FromMinutes(15), ct: ct);
             await RevertBumpAsync(workDir, bumpCommit, ct);
-            _state.Update(key, s => s.DesiredRef = s.DeployedRef); // stop retrying a bad ref
+            foreach (var p in batch) _state.Update(p.Key, s => s.DesiredRef = s.DeployedRef); // stop retrying a bad ref
             await progress.FailAsync(
                 $"{failure}\nRolled back to previous generation ({(rb.Success ? "ok" : "**rollback also failed — check the host!**")}); flake.lock bump reverted.");
             return;
         }
 
-        // 6. Success
-        _state.Update(key, s => {
-            s.PreviousRef = s.DeployedRef;
-            s.DeployedRef = target;
-            s.UpdatedAt   = DateTimeOffset.UtcNow;
-        });
+        // 6. Success — promote every batched project.
+        foreach (var p in batch) {
+            _state.Update(p.Key, s => {
+                s.PreviousRef = s.DeployedRef;
+                s.DeployedRef = p.Target;
+                s.UpdatedAt   = DateTimeOffset.UtcNow;
+            });
+        }
         TryCleanup(workDir);
-        await progress.SucceedAsync($"Now running `{target}`." + (dirty ? " flake.lock bump pushed." : ""));
+        var doneText = string.Join(", ", batch.Select(p => $"**{p.Project.DisplayName}** `{p.Target}`"));
+        await progress.SucceedAsync($"Now running {doneText}." + (dirty ? " flake.lock bump pushed." : ""));
     }
 
-    private async Task AbortAsync(ProgressReporter.Progress progress, string key,
-                                  string reason, string output) {
-        _state.Update(key, s => s.DesiredRef = s.DeployedRef); // require an explicit retry
+    private async Task AbortBatchAsync(ProgressReporter.Progress progress, List<PendingProject> batch,
+                                       string reason, string output) {
+        foreach (var p in batch) _state.Update(p.Key, s => s.DesiredRef = s.DeployedRef); // require an explicit retry
         var tail = string.IsNullOrWhiteSpace(output) ? "" : $"\n```\n{ProcessRunner.Tail(output, 1200)}\n```";
         await progress.FailAsync($"{reason}{tail}");
     }
@@ -266,39 +317,53 @@ public class Reconciler : BackgroundService {
     }
 
     // ── Self-update: detached switch + marker finalized on next startup ──────
+    //
+    // A single pending-switch marker file (not one per project) is enough: converges are
+    // fully serialized, so there's never more than one switch in flight at a time — the
+    // marker just needs to remember which project(s) were part of whichever one was.
 
-    private async Task StartDetachedSelfSwitchAsync(string key, ProjectConfig project, string target,
+    private sealed record PendingSwitchMarker(Dictionary<string, string> Targets);
+
+    private async Task StartDetachedSelfSwitchAsync(List<PendingProject> batch, string switchScript,
                                                     string workDir, ProgressReporter.Progress progress, CancellationToken ct) {
-        File.WriteAllText(PendingMarkerPath(key), target);
+        WritePendingMarker(batch);
         var run = await ProcessRunner.RunAsync("sudo",
-            ["systemd-run", "--no-block", "--unit", $"d-ploy-self-switch",
+            ["systemd-run", "--no-block", "--unit", "d-ploy-self-switch",
              "--property=SyslogIdentifier=d-ploy-self-switch",
-             project.SwitchScriptPath, "switch", workDir],
+             switchScript, "switch", workDir],
             workDir, TimeSpan.FromMinutes(2), ct: ct);
         if (!run.Success) {
-            File.Delete(PendingMarkerPath(key));
-            await AbortAsync(progress, key, "could not schedule detached self-switch", run.Output);
+            DeletePendingMarker();
+            await AbortBatchAsync(progress, batch, "could not schedule detached self-switch", run.Output);
             return;
         }
         progress.Set("switch running detached — D-Ploy will restart if its own unit changed…");
 
-        // Watch the transient unit from THIS process. Three outcomes:
-        //  - our unit changed → we get restarted; the startup marker path reports success.
+        // Watch the transient unit from THIS process, and — critically — AWAITED, not
+        // fire-and-forget: "detached" here only means the switch survives OUR OWN process
+        // restart, not that the reconciler loop should move on to another batch while it's
+        // still running. Three outcomes:
+        //  - our unit changed → we get restarted (this await never returns; that's fine —
+        //    FinalizePendingSelfSwitchAsync on the next startup finalizes from the marker,
+        //    exactly as if this had been fire-and-forget).
         //  - switch finished but our unit didn't change (bump touched nothing of ours) →
-        //    promote here, since no restart will come.
+        //    promote here (after a real health soak — see PromoteAfterSelfSwitchAsync),
+        //    since no restart will come.
         //  - switch failed → we are still alive to report it; without this, the marker
         //    would sit silent until some unrelated restart and then wrongly promote.
-        _ = Task.Run(() => MonitorDetachedSelfSwitchAsync(key, target, progress), CancellationToken.None);
+        // ct is honored throughout so a genuine shutdown (not caused by the switch itself)
+        // doesn't block for up to the full 45-minute deadline below.
+        await MonitorDetachedSelfSwitchAsync(batch, progress, ct);
     }
 
-    private async Task MonitorDetachedSelfSwitchAsync(string key, string target, ProgressReporter.Progress progress) {
-        await Task.Delay(TimeSpan.FromSeconds(10));
+    private async Task MonitorDetachedSelfSwitchAsync(List<PendingProject> batch, ProgressReporter.Progress progress, CancellationToken ct) {
+        await Task.Delay(TimeSpan.FromSeconds(10), ct);
         var deadline = DateTimeOffset.UtcNow + TimeSpan.FromMinutes(45);
 
         while (DateTimeOffset.UtcNow < deadline) {
             var show = await ProcessRunner.RunAsync("systemctl",
                 ["show", "--property=ActiveState,Result", "d-ploy-self-switch.service"],
-                timeout: TimeSpan.FromSeconds(10));
+                timeout: TimeSpan.FromSeconds(10), ct: ct);
             var props = show.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                 .Select(l => l.Split('=', 2))
                 .Where(p => p.Length == 2)
@@ -307,53 +372,91 @@ public class Reconciler : BackgroundService {
             var result = props.GetValueOrDefault("Result", "");
 
             if (active == "failed") {
-                File.Delete(PendingMarkerPath(key));
-                _state.Update(key, s => s.DesiredRef = s.DeployedRef);
+                DeletePendingMarker();
+                foreach (var p in batch) _state.Update(p.Key, s => s.DesiredRef = s.DeployedRef);
                 await progress.FailAsync("self-switch unit **failed** — old version still running. See `journalctl -u d-ploy-self-switch`.");
                 return;
             }
             if (active == "inactive" && result == "success") {
                 // Switch completed without restarting us (our own unit was unchanged).
-                File.Delete(PendingMarkerPath(key));
-                _state.Update(key, s => {
-                    s.PreviousRef = s.DeployedRef;
-                    s.DeployedRef = target;
-                    s.UpdatedAt   = DateTimeOffset.UtcNow;
-                });
-                await progress.SucceedAsync($"Switch complete (no restart needed). Now running `{target}`.");
+                await PromoteAfterSelfSwitchAsync(batch, progress, ct);
+                DeletePendingMarker();
                 return;
             }
-            await Task.Delay(TimeSpan.FromSeconds(10));
+            await Task.Delay(TimeSpan.FromSeconds(10), ct);
         }
         await progress.FailAsync("timed out watching the detached self-switch — check `journalctl -u d-ploy-self-switch`.");
     }
 
-    private async Task FinalizePendingSelfSwitchAsync(CancellationToken ct) {
-        foreach (var (key, project) in _config.Projects) {
-            var marker = PendingMarkerPath(key);
-            if (!File.Exists(marker)) continue;
-            var target = (await File.ReadAllTextAsync(marker, ct)).Trim();
-            File.Delete(marker);
+    /// <summary>Shared by MonitorDetachedSelfSwitchAsync's "no restart needed" case and
+    /// FinalizePendingSelfSwitchAsync's "we got restarted" case: soak the union of the
+    /// batch's health units before promoting, same as a normal (non-self) batch would.</summary>
+    private async Task PromoteAfterSelfSwitchAsync(List<PendingProject> batch, ProgressReporter.Progress? progress, CancellationToken ct, int? soakCap = null) {
+        var healthUnits = batch.SelectMany(p => p.Project.HealthUnits).Distinct().ToList();
+        var soakSeconds = batch.Max(p => p.Project.SoakSeconds);
+        if (soakCap is not null) soakSeconds = Math.Min(soakSeconds, soakCap.Value);
 
-            // We're running again — the switch finished (or was rolled back by hand).
-            // Soak our own health units (if any) and promote state.
-            var failure = await _health.SoakAsync(project.HealthUnits, Math.Min(project.SoakSeconds, 30), null, ct);
-            if (failure is null) {
-                _state.Update(key, s => {
-                    s.PreviousRef = s.DeployedRef;
-                    s.DeployedRef = target;
-                    s.DesiredRef  = target;
-                    s.UpdatedAt   = DateTimeOffset.UtcNow;
-                });
-                await _reporter.AnnounceAsync($"✅ **{project.DisplayName}** self-update complete — back up, now running `{target}`.");
-            } else {
-                _state.Update(key, s => s.DesiredRef = s.DeployedRef);
-                await _reporter.AnnounceAsync($"⚠️ **{project.DisplayName}** restarted after self-update to `{target}`, but: {failure}");
-            }
+        var failure = await _health.SoakAsync(healthUnits, soakSeconds, s => progress?.Set(s), ct);
+        var names = string.Join(", ", batch.Select(p => $"**{p.Project.DisplayName}**"));
+        if (failure is not null) {
+            foreach (var p in batch) _state.Update(p.Key, s => s.DesiredRef = s.DeployedRef);
+            var message = $"⚠️ {names} restarted after self-update, but: {failure}";
+            if (progress is not null) await progress.FailAsync($"Switch completed but {failure}");
+            else await _reporter.AnnounceAsync(message);
+            return;
         }
+
+        foreach (var p in batch) {
+            _state.Update(p.Key, s => {
+                s.PreviousRef = s.DeployedRef;
+                s.DeployedRef = p.Target;
+                s.DesiredRef  = p.Target;
+                s.UpdatedAt   = DateTimeOffset.UtcNow;
+            });
+        }
+        var doneText = string.Join(", ", batch.Select(p => $"{p.Key} `{p.Target}`"));
+        if (progress is not null) await progress.SucceedAsync($"Switch complete (no restart needed). Now running {doneText}.");
+        else await _reporter.AnnounceAsync($"✅ {names} self-update complete — back up, now running {doneText}.");
     }
 
-    private string PendingMarkerPath(string key) => Path.Combine(_config.DataPath, $".pending-switch-{key}");
+    private async Task FinalizePendingSelfSwitchAsync(CancellationToken ct) {
+        var path = PendingMarkerPath();
+        if (!File.Exists(path)) return;
+
+        PendingSwitchMarker? marker;
+        try {
+            marker = JsonSerializer.Deserialize<PendingSwitchMarker>(await File.ReadAllTextAsync(path, ct));
+        } catch (Exception ex) {
+            _logger.LogError(ex, "Could not read pending-switch marker {Path} — leaving state as-is", path);
+            File.Delete(path);
+            return;
+        }
+        File.Delete(path);
+        if (marker is null || marker.Targets.Count == 0) return;
+
+        var batch = marker.Targets
+            .Where(t => _config.Projects.ContainsKey(t.Key))
+            .Select(t => new PendingProject(t.Key, _config.Projects[t.Key], t.Value, _state.Get(t.Key).DeployedRef))
+            .ToList();
+        if (batch.Count == 0) return;
+
+        // We're running again — the switch finished (or was rolled back by hand). Soak is
+        // capped at 30s here (unlike a live switch's full SoakSeconds): this runs at our own
+        // startup, so it shouldn't block readiness for arbitrarily long.
+        await PromoteAfterSelfSwitchAsync(batch, null, ct, soakCap: 30);
+    }
+
+    private string PendingMarkerPath() => Path.Combine(_config.DataPath, ".pending-switch");
+
+    private void WritePendingMarker(List<PendingProject> batch) {
+        var marker = new PendingSwitchMarker(batch.ToDictionary(p => p.Key, p => p.Target));
+        File.WriteAllText(PendingMarkerPath(), JsonSerializer.Serialize(marker));
+    }
+
+    private void DeletePendingMarker() {
+        var path = PendingMarkerPath();
+        if (File.Exists(path)) File.Delete(path);
+    }
 
     // ── Small helpers ─────────────────────────────────────────────────────────
 
